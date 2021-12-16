@@ -133,6 +133,7 @@ fn panic_in_job() {
     runner.send(PanicJob(None)).unwrap();
     runner.send(PanicJob(Some(send))).unwrap();
     assert!(recv.recv_timeout(Duration::from_millis(500)).is_ok());
+    thread::sleep(Duration::from_millis(1));
 }
 
 struct TestHelper {

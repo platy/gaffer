@@ -149,22 +149,24 @@
 //!
 //! ```
 //! use gaffer::{Job, JobRunner, MergeResult, NoExclusion};
-//! use std::time::Duration;
+//! use std::{sync::{Arc, atomic::{AtomicU8, Ordering}}, time::Duration};
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let runner = JobRunner::builder().enable_merge(merge_jobs).build(1);
+//!    let counter = Arc::new(AtomicU8::new(0));
 //!
 //!     for i in 10..=50 {
-//!         runner.send(MergeJob(format!("Job {}", i)))?;
+//!         runner.send(MergeJob(format!("Job {}", i), counter.clone()))?;
 //!     }
 //!
 //!     println!("Jobs enqueued");
 //!     std::thread::sleep(Duration::from_secs(7));
+//!     assert_eq!(counter.load(Ordering::SeqCst), 5);
 //!     Ok(())
 //! }
 //!
 //! #[derive(Debug)]
-//! struct MergeJob(String);
+//! struct MergeJob(String, Arc<AtomicU8>);
 //!
 //! impl Job for MergeJob {
 //!     type Exclusion = NoExclusion;
@@ -180,6 +182,7 @@
 //!     fn execute(self) {
 //!         std::thread::sleep(Duration::from_secs(1));
 //!         println!("Completed job {:?}", self);
+//!         self.1.fetch_add(1, Ordering::SeqCst);
 //!     }
 //! }
 //!
@@ -377,7 +380,7 @@
 //!
 //!     fn execute(self) {
 //!         println!("Processing job {}", self.0);
-//!         std::thread::sleep(Duration::from_secs(1));
+//!         std::thread::sleep(Duration::from_millis(100));
 //!         self.1.fulfill(format!("Processed : [{}]", self.0));
 //!     }
 //! }
@@ -385,8 +388,6 @@
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
-
-use parking_lot::Mutex;
 
 use std::{
     fmt,
@@ -397,16 +398,20 @@ use std::{
 use runner::ConcurrencyLimitFn;
 pub use source::RecurrableJob;
 use source::{IntervalRecurringJob, RecurringJob, SourceManager};
+use supervised_pool::WorkerPool;
 
 pub mod future;
 mod runner;
 mod source;
+mod supervised_pool;
 
-/// Top level structure of the crate. Currently, recurring jobs would keep being scheduled once this is dropped, but that will probably change.
+/// Top level structure of the crate. Once dropped the pool will stop workers as they become idle, but won't stop until the currently available tasks are completed. Supervisor will keep loading tasks until it goes idle and stops.
 ///
 /// See crate level docs
+#[derive(Clone)]
 pub struct JobRunner<J> {
     sender: crossbeam_channel::Sender<J>,
+    _pool: Arc<WorkerPool>,
 }
 
 impl<J: Job + 'static> JobRunner<J> {
@@ -421,18 +426,10 @@ impl<J: Job + 'static> JobRunner<J> {
     }
 }
 
-impl<J> Clone for JobRunner<J> {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-        }
-    }
-}
-
 /// Builder of [`JobRunner`]
 pub struct Builder<J: Job + 'static> {
-    concurrency_limit: Box<ConcurrencyLimitFn<J>>,
-    recurring: Vec<Box<dyn RecurringJob<J> + Send>>,
+    concurrency_limit: Arc<ConcurrencyLimitFn<J>>,
+    recurring: Vec<Box<dyn RecurringJob<Job = J> + Send>>,
     /// optional function to allow merging of jobs
     merge_fn: Option<fn(J, &mut J) -> MergeResult<J>>,
 }
@@ -441,7 +438,7 @@ impl<J: Job + Send + 'static> Builder<J> {
     /// Start building a [`JobRunner`]
     fn new() -> Self {
         Builder {
-            concurrency_limit: Box::new(|_: <J as Prioritised>::Priority| None as Option<u8>),
+            concurrency_limit: Arc::new(|_: <J as Job>::Priority| None as Option<u8>),
             recurring: vec![],
             merge_fn: None,
         }
@@ -478,25 +475,26 @@ impl<J: Job + Send + 'static> Builder<J> {
         mut self,
         concurrency_limit: impl Fn(<J as Job>::Priority) -> Option<u8> + Send + Sync + 'static,
     ) -> Self {
-        self.concurrency_limit = Box::new(concurrency_limit);
+        self.concurrency_limit = Arc::new(concurrency_limit);
         self
     }
 
     /// Build the [`JobRunner`], spawning `thread_num` threads as workers
     pub fn build(self, thread_num: usize) -> JobRunner<J> {
-        let (sender, sources) =
-            SourceManager::<J, Box<dyn RecurringJob<J> + Send>>::new_with_recurring(
-                self.recurring,
-                self.merge_fn,
-            );
-        let jobs = Arc::new(Mutex::new(sources));
-        let _threads = runner::spawn(thread_num, jobs, self.concurrency_limit);
-        JobRunner { sender }
+        let (sender, sources) = SourceManager::<J, Box<dyn RecurringJob<Job = J> + Send>>::new(
+            self.recurring,
+            self.merge_fn,
+        );
+        let pool = runner::spawn(thread_num, sources, self.concurrency_limit);
+        JobRunner {
+            sender,
+            _pool: Arc::new(pool),
+        }
     }
 }
 
 /// A job which can be executed by the runner, with features to synchronise jobs that would interfere with each other and reduce the parallelisation of low priority jobs
-pub trait Job: Send {
+pub trait Job: Send + 'static {
     /// Type used to check which jobs should not be allowed to run concurrently, see [`Job::exclusion()`]. Use [`NoExclusion`] for jobs which can always be run at the same time, see also [`ExclusionOption`].
     type Exclusion: PartialEq + Copy + fmt::Debug + Send;
 
@@ -513,26 +511,9 @@ pub trait Job: Send {
     fn execute(self);
 }
 
-/// A type that can be put in a priority queue, tells the queue which order the items should come out in, whether / how to merge them, and checking whether item's match
-trait Prioritised: Sized {
-    /// Type of the priority, the higher prioritys are those which are larger based on [`Ord::cmp`].
-    type Priority: Ord + Copy + Send;
-
-    /// Get the priority of this thing
-    fn priority(&self) -> Self::Priority;
-}
-
-impl<J: Job> Prioritised for J {
-    type Priority = <J as Job>::Priority;
-
-    fn priority(&self) -> Self::Priority {
-        <J as Job>::priority(self)
-    }
-}
-
 impl<T> Job for T
 where
-    T: FnOnce() + Send,
+    T: FnOnce() + Send + 'static,
 {
     type Exclusion = NoExclusion;
 
