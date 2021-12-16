@@ -395,7 +395,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gaffer_queue::PriorityQueue;
 use gaffer_runner::WorkerPool;
 use runner::ConcurrencyLimitFn;
 pub use source::RecurrableJob;
@@ -481,12 +480,11 @@ impl<J: Job + Send + 'static> Builder<J> {
 
     /// Build the [`JobRunner`], spawning `thread_num` threads as workers
     pub fn build(self, thread_num: usize) -> JobRunner<J> {
-        let queue = PriorityQueue::new();
         let (sender, sources) = SourceManager::<J, Box<dyn RecurringJob<Job = J> + Send>>::new(
             self.recurring,
             self.merge_fn,
         );
-        let pool = runner::spawn(thread_num, sources, queue, self.concurrency_limit);
+        let pool = runner::spawn(thread_num, sources, self.concurrency_limit);
         JobRunner {
             sender,
             _pool: Arc::new(pool),

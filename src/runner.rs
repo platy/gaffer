@@ -1,13 +1,13 @@
 use std::{
     borrow::{Borrow, BorrowMut},
+    collections::VecDeque,
     sync::Arc,
 };
 
-use gaffer_queue::PriorityQueue;
 use gaffer_runner::WorkerPool;
 
 use crate::{
-    source::{PrioritisedJob, RecurringJob, SourceManager},
+    source::{sort_priority, RecurringJob, SourceManager},
     Job,
 };
 
@@ -18,7 +18,6 @@ pub(crate) type ConcurrencyLimitFn<J> = dyn Fn(<J as Job>::Priority) -> Option<u
 pub(crate) fn spawn<J, R: RecurringJob<Job = J> + Send + 'static>(
     thread_num: usize,
     jobs: SourceManager<J, R>,
-    queue: PriorityQueue<PrioritisedJob<J>>,
     concurrency_limit: Arc<ConcurrencyLimitFn<J>>,
 ) -> WorkerPool
 where
@@ -28,7 +27,7 @@ where
     gaffer_runner::spawn(
         thread_num,
         Supervisor {
-            queue,
+            queue: VecDeque::new(),
             concurrency_limit,
         },
         jobs,
@@ -44,7 +43,7 @@ where
 // - separate traits for the queue and supervisor would mean they can both be locked by the runner
 
 pub(crate) struct Supervisor<J: Job> {
-    queue: PriorityQueue<PrioritisedJob<J>>,
+    queue: VecDeque<J>,
     concurrency_limit: Arc<ConcurrencyLimitFn<J>>,
 }
 
@@ -52,13 +51,9 @@ impl<J: Job> Supervisor<J> {
     #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self {
-            queue: PriorityQueue::new(),
+            queue: VecDeque::new(),
             concurrency_limit: Arc::new(|_| None),
         }
-    }
-
-    pub fn enqueue(&mut self, job: J) {
-        self.queue.enqueue(PrioritisedJob(job));
     }
 }
 
@@ -70,38 +65,40 @@ impl<J: Job> gaffer_runner::Scheduler<Task<J>> for Supervisor<J> {
             running
         );
         let working_count = running.iter().filter(|state| state.is_some()).count();
-        let exclusions: Vec<_> = running.iter().flatten().collect();
         let concurrency_limit = self.concurrency_limit.clone();
-        PriorityQueue::drain_where(&mut self.queue, |job| {
-            let job = &job.0;
+        let mut skip = 0;
+        let mut jobs = vec![];
+        while jobs.len() < limit && skip < self.queue.len() {
+            let job = self.queue.get(skip).unwrap();
             if let Some(max_concurrency) = (concurrency_limit)(job.priority()) {
                 if working_count as u8 >= max_concurrency {
-                    return false;
+                    skip += 1;
+                    continue;
                 }
             }
-            if exclusions.contains(&&job.exclusion()) {
-                return false;
+            if running.iter().flatten().any(|&e| e == job.exclusion()) {
+                skip += 1;
+                continue;
             }
-            true
-        })
-        .map(|PrioritisedJob(job)| Task(job))
-        .take(limit)
-        .collect()
+            jobs.push(Task(self.queue.remove(skip).unwrap()));
+        }
+        jobs
     }
 
     fn requeue(&mut self, Task(task): Task<J>) {
-        self.queue.enqueue(PrioritisedJob(task));
+        self.queue.push_front(task);
+        sort_priority(&mut self.queue);
     }
 }
 
-impl<J: Job> Borrow<PriorityQueue<PrioritisedJob<J>>> for Supervisor<J> {
-    fn borrow(&self) -> &PriorityQueue<PrioritisedJob<J>> {
+impl<J: Job> Borrow<VecDeque<J>> for Supervisor<J> {
+    fn borrow(&self) -> &VecDeque<J> {
         &self.queue
     }
 }
 
-impl<J: Job> BorrowMut<PriorityQueue<PrioritisedJob<J>>> for Supervisor<J> {
-    fn borrow_mut(&mut self) -> &mut PriorityQueue<PrioritisedJob<J>> {
+impl<J: Job> BorrowMut<VecDeque<J>> for Supervisor<J> {
+    fn borrow_mut(&mut self) -> &mut VecDeque<J> {
         &mut self.queue
     }
 }
@@ -208,11 +205,10 @@ mod runner_test {
     fn working_to_supervisor_excluded() {
         simple_logger::SimpleLogger::new().init().unwrap();
 
-        let queue = PriorityQueue::new();
         let events = Arc::new(Mutex::new(vec![]));
         let (sender, sources) =
             SourceManager::<_, Box<dyn RecurringJob<Job = ExcludedJob> + Send>>::new(vec![], None);
-        let pool = spawn(2, sources, queue, Arc::new(|()| None));
+        let pool = spawn(2, sources, Arc::new(|()| None));
 
         thread::sleep(Duration::from_millis(10));
         sender.send(ExcludedJob(1, events.clone())).unwrap();
@@ -240,12 +236,11 @@ mod runner_test {
     #[test]
     fn working_to_supervisor_throttled() {
         let events = Arc::new(Mutex::new(vec![]));
-        let queue = PriorityQueue::new();
         let (sender, sources) = SourceManager::<
             _,
             Box<dyn RecurringJob<Job = PrioritisedJob> + Send>,
         >::new(vec![], None);
-        let pool = spawn(2, sources, queue, Arc::new(|priority| Some(priority)));
+        let pool = spawn(2, sources, Arc::new(|priority| Some(priority)));
 
         thread::sleep(Duration::from_millis(10));
         sender.send(PrioritisedJob(1, events.clone())).unwrap();

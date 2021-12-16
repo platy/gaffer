@@ -1,9 +1,10 @@
 //! Handles job sources
 
-use gaffer_queue::{Prioritised, PriorityQueue};
 use parking_lot::MutexGuard;
 use std::{
     borrow::BorrowMut,
+    cmp::Reverse,
+    collections::VecDeque,
     iter::Iterator,
     ops::{Deref, DerefMut},
     thread,
@@ -102,13 +103,21 @@ impl<J: Job, R: RecurringJob<Job = J> + Send + 'static>
                 },
             );
         }
+        let queue: &mut VecDeque<J> = scheduler.deref_mut().borrow_mut();
         for item in self.recurring.iter().flat_map(R::get).collect::<Vec<_>>() {
             for recurring in &mut self.recurring {
                 recurring.job_enqueued(&item);
             }
-            scheduler.enqueue(item);
+            queue.push_back(item);
         }
+        sort_priority(queue)
     }
+}
+
+pub(crate) fn sort_priority<J: Job>(queue: &mut VecDeque<J>) {
+    queue
+        .make_contiguous()
+        .sort_by_key(|j| Reverse(j.priority()))
 }
 
 /// Defines how a job recurs
@@ -193,17 +202,6 @@ impl<J> RecurringJob for (NeverRecur, J) {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct PrioritisedJob<T: Job>(pub T);
-
-impl<T: Job> Prioritised for PrioritisedJob<T> {
-    type Priority = T::Priority;
-
-    fn priority(&self) -> Self::Priority {
-        self.0.priority()
-    }
-}
-
 struct Receiver<T: Job> {
     recv: crossbeam_channel::Receiver<T>,
     merge_fn: Option<fn(T, &mut T) -> MergeResult<T>>,
@@ -211,11 +209,7 @@ struct Receiver<T: Job> {
 
 impl<T: Job> Receiver<T> {
     /// Processes things currently ready in the queue without blocking
-    fn process_queue_ready(
-        &mut self,
-        queue: &mut PriorityQueue<PrioritisedJob<T>>,
-        mut cb: impl FnMut(&T),
-    ) -> bool {
+    fn process_queue_ready(&mut self, queue: &mut VecDeque<T>, mut cb: impl FnMut(&T)) -> bool {
         let mut has_new = false;
         for item in self.recv.try_iter() {
             cb(&item);
@@ -226,7 +220,7 @@ impl<T: Job> Receiver<T> {
     }
 
     /// Waits up to `timeout` for the first message, if none are currently available, if some are available (and `wait_for_new` is false) it returns immediately
-    fn process_queue_timeout<'a, Q: BorrowMut<PriorityQueue<PrioritisedJob<T>>>>(
+    fn process_queue_timeout<'a, Q: BorrowMut<VecDeque<T>>>(
         &mut self,
         queue: &mut MutexGuard<'a, Q>,
         timeout: Duration,
@@ -239,7 +233,7 @@ impl<T: Job> Receiver<T> {
             match recv_result {
                 Ok(item) => {
                     cb(&item);
-                    queue.deref_mut().borrow_mut().enqueue(PrioritisedJob(item));
+                    queue.deref_mut().borrow_mut().push_back(item);
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -249,24 +243,18 @@ impl<T: Job> Receiver<T> {
         }
     }
 
-    fn enqueue_locked(&self, queue: &mut PriorityQueue<PrioritisedJob<T>>, mut job: T) {
-        let priority = job.priority();
+    fn enqueue_locked(&self, queue: &mut VecDeque<T>, mut job: T) {
         if let Some(merge_fn) = self.merge_fn {
             for existing in queue.iter_mut() {
-                match (merge_fn)(job, &mut existing.0) {
+                match (merge_fn)(job, existing) {
                     MergeResult::NotMerged(the_item) => job = the_item,
                     MergeResult::Success => {
-                        if existing.priority() != priority {
-                            todo!("priority change needs to be handled by the queue, maybe better if priority is stored outside the item");
-                            // let job = bucket.remove(idx).unwrap();
-                            // self.enqueue(job);
-                        }
                         return;
                     }
                 }
             }
         }
-        queue.enqueue(PrioritisedJob(job));
+        queue.push_back(job);
     }
 }
 
@@ -285,7 +273,6 @@ mod test {
         time::Duration,
     };
 
-    use gaffer_queue::PriorityQueue;
     use gaffer_runner::{Loader, Scheduler};
     use parking_lot::Mutex;
 
@@ -316,19 +303,110 @@ mod test {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq)]
+    struct Tester2(u8, char);
+
+    impl Job for Tester2 {
+        type Priority = u8;
+
+        fn priority(&self) -> Self::Priority {
+            self.0
+        }
+
+        type Exclusion = ();
+
+        fn exclusion(&self) -> Self::Exclusion {}
+
+        fn execute(self) {}
+    }
+
     #[test]
     fn priority_queue() {
-        let mut queue = PriorityQueue::new();
+        let mut queue = VecDeque::new();
         let (send, mut recv) = channel(None);
         send.send(Tester(2)).unwrap();
         send.send(Tester(3)).unwrap();
         send.send(Tester(1)).unwrap();
         recv.process_queue_ready(&mut queue, |_| ());
+        sort_priority(&mut queue);
         assert_eq!(
-            PriorityQueue::drain_where(&mut queue, |_| true)
-                .map(|t| t.0)
-                .collect::<Vec<_>>(),
+            queue.into_iter().collect::<Vec<_>>(),
             vec![Tester(3), Tester(2), Tester(1)]
+        )
+    }
+
+    #[test]
+    fn merge_prioritised() {
+        let mut queue = VecDeque::new();
+        let (send, mut recv) = channel::<Tester>(Some(|new, existing| {
+            if new.0 == existing.0 {
+                MergeResult::Success
+            } else {
+                MergeResult::NotMerged(new)
+            }
+        }));
+        send.send(Tester(2)).unwrap();
+        send.send(Tester(3)).unwrap();
+        send.send(Tester(1)).unwrap();
+        send.send(Tester(2)).unwrap();
+        send.send(Tester(1)).unwrap();
+        recv.process_queue_ready(&mut queue, |_| ());
+        sort_priority(&mut queue);
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![Tester(3), Tester(2), Tester(1)]
+        )
+    }
+
+    #[test]
+    fn priority_queue_elements_are_merged() {
+        let mut queue = VecDeque::new();
+        let (send, mut recv) = channel::<Tester2>(Some(|new, existing| {
+            if new.1 == existing.1 {
+                existing.0 = existing.0.max(new.0);
+                MergeResult::Success
+            } else {
+                MergeResult::NotMerged(new)
+            }
+        }));
+        send.send(Tester2(2, 'a')).unwrap();
+        send.send(Tester2(1, 'a')).unwrap();
+        send.send(Tester2(1, 'b')).unwrap();
+        send.send(Tester2(2, 'b')).unwrap();
+        send.send(Tester2(1, 'e')).unwrap();
+        send.send(Tester2(1, 'f')).unwrap();
+        send.send(Tester2(1, 'c')).unwrap();
+        send.send(Tester2(2, 'd')).unwrap();
+        send.send(Tester2(2, 'c')).unwrap();
+        recv.process_queue_ready(&mut queue, |_| ());
+        sort_priority(&mut queue);
+        let vals: String = queue.into_iter().map(|j| j.1).collect();
+        assert_eq!(vals, "abcdef");
+    }
+
+    #[test]
+    fn merge_change_priority() {
+        let mut queue = VecDeque::new();
+        let (send, mut recv) = channel::<Tester2>(Some(|new, existing| {
+            if new.1 == existing.1 {
+                existing.0 = existing.0.max(new.0);
+                MergeResult::Success
+            } else {
+                MergeResult::NotMerged(new)
+            }
+        }));
+        send.send(Tester2(1, 'c')).unwrap(); // c: low priority comes out last
+        send.send(Tester2(1, 'b')).unwrap(); // b: low priority
+        send.send(Tester2(2, 'a')).unwrap(); // a: high priority comes out first
+        recv.process_queue_ready(&mut queue, |_| ());
+        sort_priority(&mut queue);
+        send.send(Tester2(1, 'a')).unwrap(); // a: low priority merged in, has no effect
+        send.send(Tester2(2, 'b')).unwrap(); // b: high priority merged in, now comes out after 'a'
+        recv.process_queue_ready(&mut queue, |_| ());
+        sort_priority(&mut queue);
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![Tester2(2, 'a'), Tester2(2, 'b'), Tester2(1, 'c')]
         )
     }
 
@@ -425,10 +503,10 @@ mod test {
         let scheduler = Mutex::new(Supervisor::new());
         let (send, mut manager) = SourceManager::new(vec![], None);
         let start = Instant::now();
-        let half_interval_ago = start - Duration::from_millis(5);
-        manager.set_recurring(Duration::from_millis(10), half_interval_ago, Tester(1));
-        manager.set_recurring(Duration::from_millis(10), half_interval_ago, Tester(2));
-        manager.set_recurring(Duration::from_millis(10), half_interval_ago, Tester(3));
+        let half_interval_ago = start - Duration::from_millis(10);
+        manager.set_recurring(Duration::from_millis(20), half_interval_ago, Tester(1));
+        manager.set_recurring(Duration::from_millis(20), half_interval_ago, Tester(2));
+        manager.set_recurring(Duration::from_millis(20), half_interval_ago, Tester(3));
         send.send(Tester(2)).unwrap();
         manager.load(false, scheduler.lock());
         assert_eq!(
@@ -455,6 +533,7 @@ mod test {
             "Wrong result after {:?}",
             Instant::now().duration_since(restart)
         );
+        let restart = Instant::now();
         manager.load(false, scheduler.lock());
         assert_eq!(
             scheduler
@@ -463,7 +542,9 @@ mod test {
                 .into_iter()
                 .map(|Task(t)| t)
                 .collect::<Vec<_>>(),
-            vec![Tester(2)]
+            vec![Tester(2)],
+            "Wrong result after {:?}",
+            Instant::now().duration_since(restart)
         );
     }
 
@@ -542,7 +623,10 @@ mod test {
 
 #[cfg(test)]
 mod test2 {
-    use std::time::{Duration, Instant};
+    use std::{
+        mem,
+        time::{Duration, Instant},
+    };
 
     use parking_lot::Mutex;
 
@@ -568,12 +652,9 @@ mod test2 {
     #[test]
     fn timeout_expires() {
         let (_send, mut recv) = channel::<Tester>(None);
-        let queue = Mutex::new(PriorityQueue::new());
+        let queue = Mutex::new(VecDeque::new());
         recv.process_queue_timeout(&mut queue.lock(), Duration::from_micros(1), false, |_| {});
-        assert_eq!(
-            PriorityQueue::drain_where(queue.lock(), |_| true).count(),
-            0
-        );
+        assert_eq!(queue.lock().iter().count(), 0);
     }
 
     #[test]
@@ -581,13 +662,13 @@ mod test2 {
         let (send, mut recv) = channel::<Tester>(None);
         send.send(Tester(0)).unwrap();
         let instant = Instant::now();
-        let queue = Mutex::new(PriorityQueue::new());
+        let queue = Mutex::new(VecDeque::new());
         recv.process_queue_timeout(&mut queue.lock(), Duration::from_millis(1), false, |_| {});
         assert_eq!(
-            PriorityQueue::drain_where(queue.lock(), |_| true)
+            mem::take(queue.lock().deref_mut())
+                .into_iter()
                 .next()
-                .unwrap()
-                .0,
+                .unwrap(),
             Tester(0)
         );
         assert!(Instant::now().duration_since(instant) < Duration::from_millis(1));
@@ -599,11 +680,10 @@ mod test2 {
         send.send(Tester(2)).unwrap();
         send.send(Tester(3)).unwrap();
         send.send(Tester(1)).unwrap();
-        let queue = Mutex::new(PriorityQueue::new());
+        let queue = Mutex::new(VecDeque::new());
         recv.process_queue_timeout(&mut queue.lock(), Duration::from_millis(1), false, |_| {});
-        let items: Vec<_> = PriorityQueue::drain_where(queue.lock(), |_| true)
-            .map(|t| t.0)
-            .collect();
+        sort_priority(queue.lock().deref_mut());
+        let items: Vec<_> = queue.lock().drain(..).collect();
         assert_eq!(items, vec![Tester(3), Tester(2), Tester(1)]);
     }
 }
