@@ -395,14 +395,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gaffer_runner::WorkerPool;
 use runner::ConcurrencyLimitFn;
 pub use source::RecurrableJob;
 use source::{IntervalRecurringJob, RecurringJob, SourceManager};
+use supervised_pool::WorkerPool;
 
 pub mod future;
 mod runner;
 mod source;
+mod supervised_pool;
 
 /// Top level structure of the crate. Once dropped the pool will stop workers as they become idle, but won't stop until the currently available tasks are completed. Supervisor will keep loading tasks until it goes idle and stops.
 ///

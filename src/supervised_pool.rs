@@ -1,4 +1,4 @@
-//! # The gaffer runner
+//! # The gaffer worker pool
 //!
 //! A supervised, fixed size worker thread pool with no thread overhead.
 //!
@@ -19,8 +19,6 @@ use std::{
     },
     thread,
 };
-
-use crossbeam_channel::SendError;
 
 /// A task which can be executed by the runner, with features to synchronise jobs that would interfere with each other and reduce the parallelisation of low priority jobs
 pub trait Task: Send + 'static {
@@ -91,8 +89,6 @@ impl Drop for WorkerPool {
 pub trait Scheduler<T: Task>: Send + 'static {
     ///
     fn steal(&mut self, running: &[Option<T::Key>], limit: usize) -> Vec<T>;
-    /// incase the runner takes more than it can schedule, avoiding this was why i had the skip iterator in the first place, reconsider that
-    fn requeue(&mut self, task: T);
 }
 
 pub trait Loader<T: Task>: Send + 'static {
@@ -396,17 +392,16 @@ impl<T: Task> RunnerState<T> {
         // supervisor self-assigns first task, it's usually faster than waiting for another thread to wake up
         let own_task = tasks.next();
 
-        'tasks: for mut task in tasks {
+        'tasks: for task in tasks {
             let key = task.key();
             for (worker_idx, worker) in &mut available_workers {
                 if let WorkerState::Available(send) = worker {
                     log::info!("w{} to schedule {:?}", worker_idx, key);
-                    if let Err(SendError(WorkerInstruction::Assign(returned_job))) =
-                        send.send(WorkerInstruction::Assign(task))
-                    {
-                        // if a worker has died, we can try with another
-                        task = returned_job;
-                        log::warn!("w{} unreachable, task not scheduled", worker_idx);
+                    if send.send(WorkerInstruction::Assign(task)).is_err() {
+                        unreachable!(
+                            "{} available worker would not receive job",
+                            std::thread::current().name().unwrap_or_default()
+                        );
                     } else {
                         *worker = WorkerState::Working(key);
                         exclusions[worker_idx] = Some(key);
@@ -417,8 +412,6 @@ impl<T: Task> RunnerState<T> {
                     unreachable!("Only iterating over available workers");
                 }
             }
-            log::warn!("no available worker for task, returning to scheduler");
-            steal.lock().requeue(task);
         }
 
         if let Some(task) = own_task {
@@ -666,10 +659,6 @@ mod runner_state_test {
                 mem::replace(&mut self.0, remaining).into()
             }
         }
-
-        fn requeue(&mut self, task: T) {
-            self.0.push_front(task)
-        }
     }
 }
 
@@ -743,25 +732,19 @@ mod runner_test {
                 _ => vec![],
             }
         }
-
-        fn requeue(&mut self, _task: ExcludedJob) {
-            unreachable!()
-        }
     }
 
     struct Load;
     impl Loader<ExcludedJob> for Load {
         type Scheduler = Super;
 
-        fn load(&mut self, _idle: bool, _scheduler: MutexGuard<Super>) {
+        fn load(&mut self, _idle: bool, _scheduler: MutexGuard<'_, Super>) {
             thread::sleep(Duration::from_millis(1))
         }
     }
 
     #[test]
     fn working_to_supervisor_excluded() {
-        simple_logger::SimpleLogger::new().init().unwrap();
-
         let events = Arc::new(Mutex::new(vec![]));
 
         let supervisor = Super {

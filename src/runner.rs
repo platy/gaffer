@@ -4,10 +4,9 @@ use std::{
     sync::Arc,
 };
 
-use gaffer_runner::WorkerPool;
-
 use crate::{
-    source::{sort_priority, RecurringJob, SourceManager},
+    source::{RecurringJob, SourceManager},
+    supervised_pool::{self, WorkerPool},
     Job,
 };
 
@@ -24,7 +23,7 @@ where
     J: Job + 'static,
     <J as Job>::Priority: Send,
 {
-    gaffer_runner::spawn(
+    supervised_pool::spawn(
         thread_num,
         Supervisor {
             queue: VecDeque::new(),
@@ -57,7 +56,7 @@ impl<J: Job> Supervisor<J> {
     }
 }
 
-impl<J: Job> gaffer_runner::Scheduler<Task<J>> for Supervisor<J> {
+impl<J: Job> supervised_pool::Scheduler<Task<J>> for Supervisor<J> {
     fn steal(&mut self, running: &[Option<J::Exclusion>], limit: usize) -> Vec<Task<J>> {
         log::debug!(
             "Looking for up to {} tasks to execute concurrently with {:?}",
@@ -84,11 +83,6 @@ impl<J: Job> gaffer_runner::Scheduler<Task<J>> for Supervisor<J> {
         }
         jobs
     }
-
-    fn requeue(&mut self, Task(task): Task<J>) {
-        self.queue.push_front(task);
-        sort_priority(&mut self.queue);
-    }
 }
 
 impl<J: Job> Borrow<VecDeque<J>> for Supervisor<J> {
@@ -105,7 +99,7 @@ impl<J: Job> BorrowMut<VecDeque<J>> for Supervisor<J> {
 
 pub(crate) struct Task<J: Job>(pub J);
 
-impl<J> gaffer_runner::Task for Task<J>
+impl<J> supervised_pool::Task for Task<J>
 where
     J: Job,
 {
@@ -203,8 +197,6 @@ mod runner_test {
     /// exclusion prevents exclusive jobs from running at the same time
     #[test]
     fn working_to_supervisor_excluded() {
-        simple_logger::SimpleLogger::new().init().unwrap();
-
         let events = Arc::new(Mutex::new(vec![]));
         let (sender, sources) =
             SourceManager::<_, Box<dyn RecurringJob<Job = ExcludedJob> + Send>>::new(vec![], None);

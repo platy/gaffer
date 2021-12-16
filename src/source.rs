@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{runner::Supervisor, Job, MergeResult};
+use crate::{runner::Supervisor, supervised_pool, Job, MergeResult};
 
 /// Manages sources of jobs for a runner, including:
 /// * reading jobs from a channel and waiting on the channel
@@ -72,7 +72,7 @@ where
 }
 
 impl<J: Job, R: RecurringJob<Job = J> + Send + 'static>
-    gaffer_runner::Loader<crate::runner::Task<J>> for SourceManager<J, R>
+    supervised_pool::Loader<crate::runner::Task<J>> for SourceManager<J, R>
 {
     type Scheduler = Supervisor<J>;
 
@@ -114,7 +114,7 @@ impl<J: Job, R: RecurringJob<Job = J> + Send + 'static>
     }
 }
 
-pub(crate) fn sort_priority<J: Job>(queue: &mut VecDeque<J>) {
+fn sort_priority<J: Job>(queue: &mut VecDeque<J>) {
     queue
         .make_contiguous()
         .sort_by_key(|j| Reverse(j.priority()))
@@ -273,8 +273,8 @@ mod test {
         time::Duration,
     };
 
-    use gaffer_runner::{Loader, Scheduler};
     use parking_lot::Mutex;
+    use supervised_pool::{Loader, Scheduler};
 
     use crate::runner::Task;
 
